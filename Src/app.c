@@ -20,9 +20,11 @@
 
 #include <stdint.h>
 
+#include "app_ai.h"
 #include "app_cam.h"
 #include "app_config.h"
 #include "app_postprocess.h"
+#include "bqueue.h"
 #include "isp_api.h"
 #include "cmw_camera.h"
 #include "stm32n6xx_hal.h"
@@ -35,7 +37,6 @@
 #include "utils.h"
 #include "uvcl.h"
 #include "draw.h"
-#include "network.h"
 
 #include "figs.h"
 
@@ -54,7 +55,6 @@
 #define INF_INFO_FONT font_16
 #define OBJ_RECT_COLOR 0xffffffff
 
-#define BQUEUE_MAX_BUFFERS 2
 #define CPU_LOAD_HISTORY_DEPTH 8
 
 #define CAPTURE_BUFFER_NB (CAPTURE_DELAY + 2)
@@ -63,12 +63,6 @@
 #define VENC_MAX_WIDTH 1280
 #define VENC_MAX_HEIGHT 720
 #define VENC_OUT_BUFFER_SIZE (255 * 1024)
-
-/* Model Related Info */
-#define NN_BUFFER_OUT_SIZE LL_ATON_DEFAULT_OUT_1_SIZE_BYTES
-
-/* Align so we are sure nn_output_buffers[0] and nn_output_buffers[1] are aligned on 32 bytes */
-#define NN_BUFFER_OUT_SIZE_ALIGN ALIGN_VALUE(NN_BUFFER_OUT_SIZE, 32)
 
 typedef struct {
   int last;
@@ -93,17 +87,6 @@ typedef struct {
   int16_t w;
   int16_t h;
 } box_t;
-
-typedef struct {
-  SemaphoreHandle_t free;
-  StaticSemaphore_t free_buffer;
-  SemaphoreHandle_t ready;
-  StaticSemaphore_t ready_buffer;
-  int buffer_nb;
-  uint8_t *buffers[BQUEUE_MAX_BUFFERS];
-  int free_idx;
-  int ready_idx;
-} bqueue_t;
 
 typedef struct {
   uint64_t current_total;
@@ -139,15 +122,6 @@ static uint8_t capture_buffer[CAPTURE_BUFFER_NB][VENC_MAX_WIDTH * VENC_MAX_HEIGH
 static int capture_buffer_disp_idx = 1;
 static int capture_buffer_capt_idx = 0;
 
-/* model */
-LL_ATON_DECLARE_NAMED_NN_INSTANCE_AND_INTERFACE(Default);
- /* nn input buffers */
-static uint8_t nn_input_buffers[2][NN_WIDTH * NN_HEIGHT * NN_BPP] ALIGN_32 IN_PSRAM;
-static bqueue_t nn_input_queue;
- /* nn output buffers */
-static uint8_t nn_output_buffers[2][NN_BUFFER_OUT_SIZE_ALIGN] ALIGN_32;
-static bqueue_t nn_output_queue;
-
 /* venc */
 static uint8_t venc_out_buffer[VENC_OUT_BUFFER_SIZE] ALIGN_32 UNCACHED;
 static uint8_t uvc_in_buffers[VENC_OUT_BUFFER_SIZE] ALIGN_32;
@@ -159,8 +133,6 @@ static volatile int buffer_flying;
 static int force_intra;
 
  /* threads */
-static StaticTask_t nn_thread;
-static StackType_t nn_thread_stack[2 * configMINIMAL_STACK_SIZE];
 static StaticTask_t dp_thread;
 static StackType_t dp_thread_stack[2 *configMINIMAL_STACK_SIZE];
 static StaticTask_t isp_thread;
@@ -241,88 +213,6 @@ static void stat_info_copy(stat_info_t *copy)
   assert(ret == pdTRUE);
 }
 
-static int bqueue_init(bqueue_t *bq, int buffer_nb, uint8_t **buffers)
-{
-  int i;
-
-  if (buffer_nb > BQUEUE_MAX_BUFFERS)
-    return -1;
-
-  bq->free = xSemaphoreCreateCountingStatic(buffer_nb, buffer_nb, &bq->free_buffer);
-  if (!bq->free)
-    goto free_sem_error;
-  bq->ready = xSemaphoreCreateCountingStatic(buffer_nb, 0, &bq->ready_buffer);
-  if (!bq->ready)
-    goto ready_sem_error;
-
-  bq->buffer_nb = buffer_nb;
-  for (i = 0; i < buffer_nb; i++) {
-    assert(buffers[i]);
-    bq->buffers[i] = buffers[i];
-  }
-  bq->free_idx = 0;
-  bq->ready_idx = 0;
-
-  return 0;
-
-ready_sem_error:
-  vSemaphoreDelete(bq->free);
-free_sem_error:
-  return -1;
-}
-
-static uint8_t *bqueue_get_free(bqueue_t *bq, int is_blocking)
-{
-  uint8_t *res;
-  int ret;
-
-  ret = xSemaphoreTake(bq->free, is_blocking ? portMAX_DELAY : 0);
-  if (ret == pdFALSE)
-    return NULL;
-
-  res = bq->buffers[bq->free_idx];
-  bq->free_idx = (bq->free_idx + 1) % bq->buffer_nb;
-
-  return res;
-}
-
-static void bqueue_put_free(bqueue_t *bq)
-{
-  int ret;
-
-  ret = xSemaphoreGive(bq->free);
-  assert(ret == pdTRUE);
-}
-
-static uint8_t *bqueue_get_ready(bqueue_t *bq)
-{
-  uint8_t *res;
-  int ret;
-
-  ret = xSemaphoreTake(bq->ready, portMAX_DELAY);
-  assert(ret == pdTRUE);
-
-  res = bq->buffers[bq->ready_idx];
-  bq->ready_idx = (bq->ready_idx + 1) % bq->buffer_nb;
-
-  return res;
-}
-
-static void bqueue_put_ready(bqueue_t *bq)
-{
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  int ret;
-
-  if (xPortIsInsideInterrupt()) {
-    ret = xSemaphoreGiveFromISR(bq->ready, &xHigherPriorityTaskWoken);
-    assert(ret == pdTRUE);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-  } else {
-    ret = xSemaphoreGive(bq->ready);
-    assert(ret == pdTRUE);
-  }
-}
-
 static void app_main_pipe_frame_event()
 {
   int next_disp_idx = (capture_buffer_disp_idx + 1) % CAPTURE_BUFFER_NB;
@@ -342,12 +232,12 @@ static void app_ancillary_pipe_frame_event()
   uint8_t *next_buffer;
   int ret;
 
-  next_buffer = bqueue_get_free(&nn_input_queue, 0);
+  next_buffer = bqueue_get_free(app_ai_get_input_queue(), 0);
   if (next_buffer) {
     ret = HAL_DCMIPP_PIPE_SetMemoryAddress(CMW_CAMERA_GetDCMIPPHandle(), DCMIPP_PIPE2,
                                            DCMIPP_MEMORY_ADDRESS_0, (uint32_t) next_buffer);
     assert(ret == HAL_OK);
-    bqueue_put_ready(&nn_input_queue);
+    bqueue_put_ready(app_ai_get_input_queue());
   }
 }
 
@@ -359,72 +249,6 @@ static void app_main_pipe_vsync_event()
   ret = xSemaphoreGiveFromISR(isp_sem, &xHigherPriorityTaskWoken);
   if (ret == pdTRUE)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-static void nn_thread_fct(void *arg)
-{
-  const LL_Buffer_InfoTypeDef *nn_out_info = LL_ATON_Output_Buffers_Info_Default();
-  const LL_Buffer_InfoTypeDef *nn_in_info = LL_ATON_Input_Buffers_Info_Default();
-  uint32_t nn_period_ms;
-  uint32_t nn_period[2];
-  uint8_t *nn_pipe_dst;
-  uint32_t nn_out_len;
-  uint32_t nn_in_len;
-  uint32_t total_ts;
-  uint32_t ts;
-  int ret;
-
-  (void) nn_period_ms;
-
-  /* Initialize Cube.AI/ATON ... */
-  LL_ATON_RT_RuntimeInit();
-  /* ... and model instance */
-  LL_ATON_RT_Init_Network(&NN_Instance_Default);
-
-  /* setup inout buffers and size */
-  nn_in_len = LL_Buffer_len(&nn_in_info[0]);
-  nn_out_len = LL_Buffer_len(&nn_out_info[0]);
-  //printf("nn_out_len = %d\n", nn_out_len);
-  assert(nn_out_len == NN_BUFFER_OUT_SIZE);
-
-  /*** App Loop ***************************************************************/
-  nn_period[1] = HAL_GetTick();
-
-  nn_pipe_dst = bqueue_get_free(&nn_input_queue, 0);
-  assert(nn_pipe_dst);
-  CAM_NNPipe_Start(nn_pipe_dst, CMW_MODE_CONTINUOUS);
-  while (1)
-  {
-    uint8_t *capture_buffer;
-    uint8_t *output_buffer;
-
-    nn_period[0] = nn_period[1];
-    nn_period[1] = HAL_GetTick();
-    nn_period_ms = nn_period[1] - nn_period[0];
-
-    capture_buffer = bqueue_get_ready(&nn_input_queue);
-    assert(capture_buffer);
-    output_buffer = bqueue_get_free(&nn_output_queue, 1);
-    assert(output_buffer);
-
-    total_ts = HAL_GetTick();
-    /* run ATON inference */
-    ts = HAL_GetTick();
-     /* Note that we don't need to clean/invalidate those input buffers since they are only access in hardware */
-    ret = LL_ATON_Set_User_Input_Buffer_Default(0, capture_buffer, nn_in_len);
-     /* Invalidate output buffer before Hw access it */
-    CACHE_OP(SCB_InvalidateDCache_by_Addr(output_buffer, nn_out_len));
-    ret = LL_ATON_Set_User_Output_Buffer_Default(0, output_buffer, nn_out_len);
-    assert(ret == LL_ATON_User_IO_NOERROR);
-    Run_Inference(&NN_Instance_Default);
-    time_stat_update(&stat_info.nn_inference_time, HAL_GetTick() - ts);
-
-    /* release buffers */
-    bqueue_put_free(&nn_input_queue);
-    bqueue_put_ready(&nn_output_queue);
-
-    time_stat_update(&stat_info.nn_total_time, HAL_GetTick() - total_ts);
-  }
 }
 
 static size_t encode_display(int is_intra_force, uint8_t *p_buffer)
@@ -661,12 +485,12 @@ static void dp_thread_fct(void *arg)
   int ret;
 
   /* setup post process */
-  app_postprocess_init(&pp_params, &NN_Instance_Default);
+  app_postprocess_init(&pp_params, app_ai_get_nn_instance());
   while (1)
   {
     uint8_t *output_buffer;
 
-    output_buffer = bqueue_get_ready(&nn_output_queue);
+    output_buffer = bqueue_get_ready(app_ai_get_output_queue());
     assert(output_buffer);
     total_ts = HAL_GetTick();
 
@@ -685,7 +509,7 @@ static void dp_thread_fct(void *arg)
     if (is_dp_done)
       time_stat_update(&stat_info.disp_total_time, HAL_GetTick() - total_ts);
 
-    bqueue_put_free(&nn_output_queue);
+    bqueue_put_free(app_ai_get_output_queue());
   }
 }
 
@@ -739,12 +563,6 @@ void app_run()
 
   cpuload_init(&cpu_load);
 
-  /* create buffer queues */
-  ret = bqueue_init(&nn_input_queue, 2, (uint8_t *[2]){nn_input_buffers[0], nn_input_buffers[1]});
-  assert(ret == 0);
-  ret = bqueue_init(&nn_output_queue, 2, (uint8_t *[2]){nn_output_buffers[0], nn_output_buffers[1]});
-  assert(ret == 0);
-
   /* setup fonts */
   ret = DRAW_FontSetup(&Font12, &font_12);
   assert(ret == 0);
@@ -786,13 +604,14 @@ void app_run()
   stat_info_lock = xSemaphoreCreateMutexStatic(&stat_info_lock_buffer);
   assert(stat_info_lock);
 
+  /* AI module init */
+  app_ai_init(stat_info_lock, &stat_info.nn_total_time, &stat_info.nn_inference_time);
+
   /* Start LCD Display camera pipe stream */
   CAM_DisplayPipe_Start(capture_buffer[0], CMW_MODE_CONTINUOUS);
 
   /* threads init */
-  hdl = xTaskCreateStatic(nn_thread_fct, "nn", configMINIMAL_STACK_SIZE * 2, NULL, nn_priority, nn_thread_stack,
-                          &nn_thread);
-  assert(hdl != NULL);
+  app_ai_start(nn_priority);
   hdl = xTaskCreateStatic(dp_thread_fct, "dp", configMINIMAL_STACK_SIZE * 2, NULL, dp_priority, dp_thread_stack,
                           &dp_thread);
   assert(hdl != NULL);
