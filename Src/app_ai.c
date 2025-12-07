@@ -22,7 +22,8 @@
 #include "bqueue.h"
 #include "cmw_camera.h"
 #include "network.h"
-#include "utils.h"
+#include "fal/fal_npu.h"
+#include "fal/fal_ai_model.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -30,12 +31,6 @@
 #include <assert.h>
 
 #define ALIGN_VALUE(_v_,_a_) (((_v_) + (_a_) - 1) & ~((_a_) - 1))
-
-#define CACHE_OP(__op__) do { \
-  if (is_cache_enable()) { \
-    __op__; \
-  } \
-} while (0)
 
 /* Model Related Info */
 #define NN_BUFFER_OUT_SIZE LL_ATON_DEFAULT_OUT_1_SIZE_BYTES
@@ -49,8 +44,11 @@ typedef struct {
   float mean;
 } nn_time_stat_t;
 
-/* NN Model Instance and Interface */
+/* NN Model Instance and Interface (for FAL registration) */
 LL_ATON_DECLARE_NAMED_NN_INSTANCE_AND_INTERFACE(Default);
+
+/* FAL model handle */
+static fal_ai_model_t ai_model = NULL;
 
 /* NN input buffers */
 static uint8_t nn_input_buffers[2][NN_WIDTH * NN_HEIGHT * NN_BPP] ALIGN_32 IN_PSRAM;
@@ -68,15 +66,6 @@ static StackType_t nn_thread_stack[2 * configMINIMAL_STACK_SIZE];
 static SemaphoreHandle_t stat_lock;
 static nn_time_stat_t *stat_nn_total;
 static nn_time_stat_t *stat_nn_inference;
-
-static int is_cache_enable(void)
-{
-#if defined(USE_DCACHE)
-  return 1;
-#else
-  return 0;
-#endif
-}
 
 static void time_stat_update(nn_time_stat_t *p_stat, int value)
 {
@@ -96,28 +85,28 @@ static void time_stat_update(nn_time_stat_t *p_stat, int value)
 
 static void nn_thread_fct(void *arg)
 {
-  const LL_Buffer_InfoTypeDef *nn_out_info = LL_ATON_Output_Buffers_Info_Default();
-  const LL_Buffer_InfoTypeDef *nn_in_info = LL_ATON_Input_Buffers_Info_Default();
+  fal_ai_model_info_t model_info;
   uint32_t nn_period_ms;
   uint32_t nn_period[2];
   uint8_t *nn_pipe_dst;
-  uint32_t nn_out_len;
-  uint32_t nn_in_len;
   uint32_t total_ts;
   uint32_t ts;
-  int ret;
+  fal_ai_model_err_t err;
 
   (void) nn_period_ms;
 
-  /* Initialize Cube.AI/ATON ... */
-  LL_ATON_RT_RuntimeInit();
-  /* ... and model instance */
-  LL_ATON_RT_Init_Network(&NN_Instance_Default);
+  /* Initialize NPU via FAL */
+  err = fal_npu_init();
+  assert(err == FAL_NPU_OK);
 
-  /* setup inout buffers and size */
-  nn_in_len = LL_Buffer_len(&nn_in_info[0]);
-  nn_out_len = LL_Buffer_len(&nn_out_info[0]);
-  assert(nn_out_len == NN_BUFFER_OUT_SIZE);
+  /* Initialize model via FAL */
+  err = fal_ai_model_init(ai_model);
+  assert(err == FAL_AI_MODEL_OK);
+
+  /* Get model info */
+  err = fal_ai_model_get_info(ai_model, &model_info);
+  assert(err == FAL_AI_MODEL_OK);
+  assert(model_info.output_size == NN_BUFFER_OUT_SIZE);
 
   /*** App Loop ***************************************************************/
   nn_period[1] = HAL_GetTick();
@@ -140,15 +129,23 @@ static void nn_thread_fct(void *arg)
     assert(output_buffer);
 
     total_ts = HAL_GetTick();
-    /* run ATON inference */
+
+    /* Setup I/O buffers via FAL */
     ts = HAL_GetTick();
-     /* Note that we don't need to clean/invalidate those input buffers since they are only access in hardware */
-    ret = LL_ATON_Set_User_Input_Buffer_Default(0, capture_buffer, nn_in_len);
-     /* Invalidate output buffer before Hw access it */
-    CACHE_OP(SCB_InvalidateDCache_by_Addr(output_buffer, nn_out_len));
-    ret = LL_ATON_Set_User_Output_Buffer_Default(0, output_buffer, nn_out_len);
-    assert(ret == LL_ATON_User_IO_NOERROR);
-    Run_Inference(&NN_Instance_Default);
+    /* Note: input buffers are only accessed by hardware (camera DMA), no cache op needed */
+    err = fal_ai_model_set_input(ai_model, 0, capture_buffer, model_info.input_size);
+    assert(err == FAL_AI_MODEL_OK);
+
+    /* Invalidate output buffer before NPU accesses it */
+    fal_npu_cache_invalidate(output_buffer, model_info.output_size);
+
+    err = fal_ai_model_set_output(ai_model, 0, output_buffer, model_info.output_size);
+    assert(err == FAL_AI_MODEL_OK);
+
+    /* Run inference via FAL */
+    err = fal_ai_model_run(ai_model);
+    assert(err == FAL_AI_MODEL_OK);
+
     time_stat_update(stat_nn_inference, HAL_GetTick() - ts);
 
     /* release buffers */
@@ -162,11 +159,20 @@ static void nn_thread_fct(void *arg)
 void app_ai_init(SemaphoreHandle_t stat_lock_handle, void *stat_total, void *stat_inference)
 {
   int ret;
+  fal_ai_model_err_t err;
 
   /* Store statistics pointers */
   stat_lock = stat_lock_handle;
   stat_nn_total = (nn_time_stat_t *)stat_total;
   stat_nn_inference = (nn_time_stat_t *)stat_inference;
+
+  /* Register model with FAL */
+  err = fal_ai_model_register("Default", (void *)&NN_Interface_Default, &NN_Instance_Default);
+  assert(err == FAL_AI_MODEL_OK);
+
+  /* Get model handle */
+  ai_model = fal_ai_model_get("Default");
+  assert(ai_model != NULL);
 
   /* Create buffer queues */
   ret = bqueue_init(&nn_input_queue, 2, (uint8_t *[2]){nn_input_buffers[0], nn_input_buffers[1]});
@@ -196,5 +202,5 @@ bqueue_t *app_ai_get_output_queue(void)
 
 void *app_ai_get_nn_instance(void)
 {
-  return &NN_Instance_Default;
+  return fal_ai_model_get_instance(ai_model);
 }

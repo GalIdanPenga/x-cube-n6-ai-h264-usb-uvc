@@ -57,6 +57,11 @@ C_SOURCES += Model/network.c
 C_SOURCES += Src/app_cam.c
 C_SOURCES += Src/freertos_bsp.c
 
+# FAL - Firmware Abstraction Layer
+C_SOURCES += Src/fal/fal_npu.c
+C_SOURCES += Src/fal/fal_ai_model.c
+C_SOURCES += Src/fal/fal_ai_pipe.c
+
 # ASM sources
 ASM_SOURCES =
 ASM_SOURCES_S =
